@@ -21,10 +21,17 @@ from . import models, schemas
 from .bt import build_param_space, design_matrix, fit_bradley_terry, matrix_rank
 from .db import Base, engine, get_db
 from .scheduler import MAX_CANDIDATES, build_plan
+from .snapshot import (
+    get_ranking_snapshot,
+    ranking_cache,
+    free_manuscripts as _free_manuscripts,
+)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    # 每个应用生命周期（含每个 TestClient 用例）从空缓存开始，避免跨库/跨用例串数据
+    ranking_cache.clear()
     Base.metadata.create_all(engine)
     yield
 
@@ -70,26 +77,6 @@ def _matches_with_status(db: Session, statuses: tuple[str, ...]) -> list[models.
 
 def _rows_of(matches: list[models.Match]) -> list[tuple[int, int, int]]:
     return [(m.left_model_id, m.right_model_id, m.editor_id) for m in matches]
-
-
-def _free_manuscripts(db: Session) -> list[str]:
-    """空闲原稿 = 无待交场次 且 未被补发过（每篇原稿最多补一场）。
-
-    已撤回的补发不占名额（撤回后可重派）。
-    """
-    all_ms = set(db.scalars(select(models.Match.manuscript_id)).all())
-    occupied = set(
-        db.scalars(select(models.Match.manuscript_id).where(models.Match.status == models.PENDING)).all()
-    )
-    supplemented = set(
-        db.scalars(
-            select(models.Match.manuscript_id).where(
-                models.Match.origin == models.ORIGIN_PLAN,
-                models.Match.status.in_((models.PENDING, models.COMPLETED)),
-            )
-        ).all()
-    )
-    return sorted(all_ms - occupied - supplemented)
 
 
 def _build_plan(db: Session):
@@ -267,60 +254,75 @@ def withdraw_match(match_id: int, db: Session = Depends(get_db)):
 
 @app.get("/ranking", response_model=Union[schemas.RankingOk, schemas.RankingInsufficient], tags=["排名"])
 def ranking(l2: float = Query(0.1, gt=0.0, description="L2 正则强度"), db: Session = Depends(get_db)):
-    """实收答卷满列秩则拟合并给出排名；否则返回补发计划（或无解时的最高秩）。"""
-    ps, model_ids, editor_ids, reference = _param_space(db)
-    received = _matches_with_status(db, (models.COMPLETED,))
-    pending = _matches_with_status(db, (models.PENDING,))
-    X = design_matrix(_rows_of(received), ps)
-    rank = matrix_rank(X)
+    """实收答卷满列秩则拟合并给出排名；否则返回补发计划（或无解时的最高秩）。
 
-    if ps.n_params > 0 and rank < ps.n_params:
-        _, _, _, plan = _build_plan(db)
+    实收答卷按 (左模型, 右模型, 编辑) 在 SQL 端汇总左右胜票数，每种组合在
+    设计矩阵中只占一行（票数作为权重，似然仍按每票计入）。数据未变时复用
+    进程内缓存的票数与秩，仅按本次 ``l2`` 重新拟合。
+    """
+    snap = get_ranking_snapshot(db)
+    ps = snap.ps
+
+    if ps.n_params > 0 and snap.rank < ps.n_params:
+        plan = build_plan(
+            snap.received_rows,
+            snap.pending_rows,
+            snap.free_manuscripts,
+            snap.editor_ids,
+            snap.model_ids,
+            ps,
+        )
         return schemas.RankingInsufficient(
-            rank=rank,
+            rank=snap.rank,
             n_params=ps.n_params,
-            deficiency=ps.n_params - rank,
-            n_responses=len(received),
-            n_pending=len(pending),
+            deficiency=ps.n_params - snap.rank,
+            n_responses=snap.n_responses,
+            n_pending=snap.n_pending,
             plan=_plan_out(plan),
         )
 
-    # 满列秩：L2 正则拟合
+    # 满列秩：每种组合一行，按汇总票数加权做 L2 正则拟合
     if ps.n_params == 0:
         theta = np.zeros(0)
         nll = None
         success = None
     else:
-        y = np.array([1.0 if m.winner == "left" else 0.0 for m in received])
-        fit = fit_bradley_terry(X, y, l2)
+        totals = np.array([g.n_votes for g in snap.groups], dtype=float)
+        left_wins = np.array([g.left_wins for g in snap.groups], dtype=float)
+        y = left_wins / totals  # 左胜比例；配合 totals 权重等价于逐票 y∈{0,1}
+        fit = fit_bradley_terry(snap.X, y, l2, weights=totals)
         theta, nll, success = fit.theta, fit.neg_log_likelihood, fit.success
 
-    model_rows = list(db.scalars(select(models.Model).order_by(models.Model.id)).all())
-    editor_rows = list(db.scalars(select(models.Editor).order_by(models.Editor.id)).all())
-
     scored = []
-    for m in model_rows:
-        score = 0.0 if m.id == reference else float(theta[ps.score_col[m.id]])
-        scored.append((m, score))
-    scored.sort(key=lambda t: (-t[1], t[0].id))
+    for model_id, name in snap.model_names:
+        score = 0.0 if model_id == snap.reference else float(theta[ps.score_col[model_id]])
+        scored.append((model_id, name, score))
+    scored.sort(key=lambda t: (-t[2], t[0]))
 
     biases = sorted(
-        (schemas.EditorBias(editor_id=e.id, name=e.name, bias=float(theta[ps.bias_col[e.id]])) for e in editor_rows),
+        (
+            schemas.EditorBias(
+                editor_id=editor_id,
+                name=name,
+                bias=float(theta[ps.bias_col[editor_id]]),
+            )
+            for editor_id, name in snap.editor_names
+        ),
         key=lambda b: (-b.bias, b.editor_id),
     )
 
     return schemas.RankingOk(
-        reference_model_id=reference,
+        reference_model_id=snap.reference,
         l2=l2,
-        rank=rank,
+        rank=snap.rank,
         n_params=ps.n_params,
-        n_responses=len(received),
-        n_pending=len(pending),
+        n_responses=snap.n_responses,
+        n_pending=snap.n_pending,
         neg_log_likelihood=nll,
         optimizer_success=success,
         models=[
-            schemas.ModelScore(model_id=m.id, name=m.name, score=score, rank=i + 1)
-            for i, (m, score) in enumerate(scored)
+            schemas.ModelScore(model_id=model_id, name=name, score=score, rank=i + 1)
+            for i, (model_id, name, score) in enumerate(scored)
         ],
         editors=biases,
     )

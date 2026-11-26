@@ -91,19 +91,33 @@ class FitResult:
     message: str
 
 
-def fit_bradley_terry(X: np.ndarray, y: np.ndarray, l2: float = 0.1) -> FitResult:
+def fit_bradley_terry(
+    X: np.ndarray,
+    y: np.ndarray,
+    l2: float = 0.1,
+    weights: np.ndarray | None = None,
+) -> FitResult:
     """L2 正则的 Bradley–Terry 最大似然拟合。
 
-    最小化  sum(softplus(eta) - y * eta) + l2/2 * ||theta||^2 ，
+    最小化  sum_i w_i * (softplus(eta_i) - y_i * eta_i)
+            + l2/2 * ||theta||^2 ，
     其中 eta = X @ theta，y=1 表示左栏胜。
+
+    ``weights`` 为每行的票数权重：按 (左模型, 右模型, 编辑) 聚合后，
+    每种组合只有一行 X，令 w=总票数、y=左胜票数/总票数，
+    目标函数与逐份答卷逐票计入似然完全等价。weights=None 时每行权重为 1。
     """
     y = np.asarray(y, dtype=float)
+    if weights is None:
+        w = np.ones(X.shape[0], dtype=float)
+    else:
+        w = np.asarray(weights, dtype=float)
 
     def objective(theta: np.ndarray) -> tuple[float, np.ndarray]:
         eta = X @ theta
-        nll = float(np.sum(np.logaddexp(0.0, eta) - y * eta))
+        nll = float(np.sum(w * (np.logaddexp(0.0, eta) - y * eta)))
         nll += 0.5 * l2 * float(theta @ theta)
-        grad = X.T @ (expit(eta) - y) + l2 * theta
+        grad = X.T @ (w * (expit(eta) - y)) + l2 * theta
         return nll, grad
 
     res = minimize(objective, np.zeros(X.shape[1]), jac=True, method="L-BFGS-B")
